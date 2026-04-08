@@ -29,6 +29,8 @@ env:
 jobs:
   resolve:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       has_release: ${{ steps.state.outputs.has_release }}
       source_repo: ${{ steps.state.outputs.source_repo }}
