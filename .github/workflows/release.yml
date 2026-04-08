@@ -96,6 +96,10 @@ jobs:
   build-linux-windows:
     needs: resolve
     runs-on: ubuntu-latest
+    env:
+      SOURCE_REPO_APP_ID: ${{ secrets.SOURCE_REPO_APP_ID }}
+      SOURCE_REPO_APP_PRIVATE_KEY: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+      SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -111,11 +115,11 @@ jobs:
     steps:
       - name: Create source repo app token
         id: app-token
-        if: ${{ secrets.SOURCE_REPO_APP_ID != '' && secrets.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
+        if: ${{ env.SOURCE_REPO_APP_ID != '' && env.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.SOURCE_REPO_APP_ID }}
-          private-key: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+          app-id: ${{ env.SOURCE_REPO_APP_ID }}
+          private-key: ${{ env.SOURCE_REPO_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ needs.resolve.outputs.source_repo_name }}
 
@@ -125,7 +129,7 @@ jobs:
         run: |
           TOKEN="${{ steps.app-token.outputs.token }}"
           if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.SOURCE_REPO_TOKEN }}"
+            TOKEN="${SOURCE_REPO_TOKEN}"
           fi
           if [ -z "$TOKEN" ]; then
             echo "Missing SOURCE_REPO_TOKEN or SOURCE_REPO_APP_* secrets"
@@ -192,14 +196,22 @@ jobs:
     needs: resolve
     runs-on: macos-latest
     environment: release
+    env:
+      SOURCE_REPO_APP_ID: ${{ secrets.SOURCE_REPO_APP_ID }}
+      SOURCE_REPO_APP_PRIVATE_KEY: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+      SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+      MACOS_SIGNING_KEY: ${{ secrets.MACOS_SIGNING_KEY }}
+      MACOS_SIGNING_KEY_PASSWORD: ${{ secrets.MACOS_SIGNING_KEY_PASSWORD }}
+      APPLE_IDENTITY: ${{ secrets.APPLE_IDENTITY }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
       - name: Create source repo app token
         id: app-token
-        if: ${{ secrets.SOURCE_REPO_APP_ID != '' && secrets.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
+        if: ${{ env.SOURCE_REPO_APP_ID != '' && env.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.SOURCE_REPO_APP_ID }}
-          private-key: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+          app-id: ${{ env.SOURCE_REPO_APP_ID }}
+          private-key: ${{ env.SOURCE_REPO_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ needs.resolve.outputs.source_repo_name }}
 
@@ -209,7 +221,7 @@ jobs:
         run: |
           TOKEN="${{ steps.app-token.outputs.token }}"
           if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.SOURCE_REPO_TOKEN }}"
+            TOKEN="${SOURCE_REPO_TOKEN}"
           fi
           if [ -z "$TOKEN" ]; then
             echo "Missing SOURCE_REPO_TOKEN or SOURCE_REPO_APP_* secrets"
@@ -256,10 +268,7 @@ jobs:
           npm run build
 
       - name: Import macOS signing certificate
-        if: ${{ secrets.MACOS_SIGNING_KEY != '' }}
-        env:
-          MACOS_SIGNING_KEY: ${{ secrets.MACOS_SIGNING_KEY }}
-          MACOS_SIGNING_KEY_PASSWORD: ${{ secrets.MACOS_SIGNING_KEY_PASSWORD }}
+        if: ${{ env.MACOS_SIGNING_KEY != '' }}
         shell: bash
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
@@ -297,9 +306,7 @@ jobs:
           rm -f ./openelf dist/openelf
 
       - name: Codesign .app
-        if: ${{ secrets.APPLE_IDENTITY != '' }}
-        env:
-          APPLE_IDENTITY: ${{ secrets.APPLE_IDENTITY }}
+        if: ${{ env.APPLE_IDENTITY != '' }}
         shell: bash
         run: |
           BUNDLE="source/app/macos/build/OpenELF.app"
@@ -325,7 +332,7 @@ jobs:
             "${BUNDLE}"
 
       - name: Verify codesign
-        if: ${{ secrets.APPLE_IDENTITY != '' }}
+        if: ${{ env.APPLE_IDENTITY != '' }}
         shell: bash
         run: |
           BUNDLE="source/app/macos/build/OpenELF.app"
@@ -337,7 +344,7 @@ jobs:
         env:
           APPLE_ID: ${{ vars.APPLE_ID }}
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_PASSWORD: ${{ env.APPLE_APP_PASSWORD }}
         shell: bash
         run: |
           ditto -c -k --keepParent source/app/macos/build/OpenELF.app source/dist/OpenELF-notarize.zip
@@ -362,9 +369,7 @@ jobs:
             || true
 
       - name: Codesign DMG
-        if: ${{ secrets.APPLE_IDENTITY != '' }}
-        env:
-          APPLE_IDENTITY: ${{ secrets.APPLE_IDENTITY }}
+        if: ${{ env.APPLE_IDENTITY != '' }}
         shell: bash
         run: |
           codesign --sign "${APPLE_IDENTITY}" --timestamp --force \
@@ -390,16 +395,20 @@ jobs:
       - build-macos
     runs-on: ubuntu-latest
     environment: release
+    env:
+      SOURCE_REPO_APP_ID: ${{ secrets.SOURCE_REPO_APP_ID }}
+      SOURCE_REPO_APP_PRIVATE_KEY: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+      SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
     permissions:
       contents: write
     steps:
       - name: Create source repo app token
         id: app-token
-        if: ${{ secrets.SOURCE_REPO_APP_ID != '' && secrets.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
+        if: ${{ env.SOURCE_REPO_APP_ID != '' && env.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.SOURCE_REPO_APP_ID }}
-          private-key: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+          app-id: ${{ env.SOURCE_REPO_APP_ID }}
+          private-key: ${{ env.SOURCE_REPO_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ needs.resolve.outputs.source_repo_name }}
 
@@ -409,7 +418,7 @@ jobs:
         run: |
           TOKEN="${{ steps.app-token.outputs.token }}"
           if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.SOURCE_REPO_TOKEN }}"
+            TOKEN="${SOURCE_REPO_TOKEN}"
           fi
           if [ -z "$TOKEN" ]; then
             echo "Missing SOURCE_REPO_TOKEN or SOURCE_REPO_APP_* secrets"
