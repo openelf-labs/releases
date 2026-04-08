@@ -4,6 +4,8 @@ on:
   repository_dispatch:
     types:
       - source-release
+  schedule:
+    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       source_repo:
@@ -28,7 +30,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-stage-${{ github.event.client_payload.release_tag || inputs.source_tag || github.run_id }}
+  group: release-stage-${{ github.event.client_payload.release_tag || inputs.source_tag || 'scheduled' }}
   cancel-in-progress: false
 
 env:
@@ -37,7 +39,12 @@ env:
 jobs:
   resolve:
     runs-on: ubuntu-latest
+    env:
+      SOURCE_REPO_APP_ID: ${{ secrets.SOURCE_REPO_APP_ID }}
+      SOURCE_REPO_APP_PRIVATE_KEY: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+      SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
     outputs:
+      should_stage: ${{ steps.params.outputs.should_stage }}
       source_repo: ${{ steps.params.outputs.source_repo }}
       source_repo_name: ${{ steps.params.outputs.source_repo_name }}
       source_tag: ${{ steps.params.outputs.source_tag }}
@@ -46,8 +53,38 @@ jobs:
       version: ${{ steps.params.outputs.version }}
       channel: ${{ steps.params.outputs.channel }}
     steps:
+      - name: Checkout release repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Create source repo app token
+        id: app-token
+        if: ${{ env.SOURCE_REPO_APP_ID != '' && env.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ env.SOURCE_REPO_APP_ID }}
+          private-key: ${{ env.SOURCE_REPO_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: openelf
+
+      - name: Resolve source discovery token
+        id: source-token
+        shell: bash
+        run: |
+          TOKEN="${{ steps.app-token.outputs.token }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${SOURCE_REPO_TOKEN}"
+          fi
+          if [ -z "$TOKEN" ]; then
+            echo "Missing SOURCE_REPO_TOKEN or SOURCE_REPO_APP_* secrets"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
       - name: Resolve release parameters
         id: params
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
@@ -55,11 +92,47 @@ jobs:
             SOURCE_TAG="${{ github.event.client_payload.source_tag }}"
             SOURCE_SHA="${{ github.event.client_payload.source_sha }}"
             VERSION_INPUT="${{ github.event.client_payload.version }}"
+            SHOULD_STAGE="true"
           else
-            SOURCE_REPO="${{ inputs.source_repo }}"
-            SOURCE_TAG="${{ inputs.source_tag }}"
-            SOURCE_SHA="${{ inputs.source_sha }}"
-            VERSION_INPUT="${{ inputs.version }}"
+            if [ "${{ github.event_name }}" = "schedule" ]; then
+              SOURCE_REPO="openelf-labs/openelf"
+              gh api "repos/${SOURCE_REPO}/tags?per_page=100" > "$RUNNER_TEMP/source-tags.json"
+              gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+              python3 scripts/discover_pending_source_release.py \
+                --source-tags-json "$RUNNER_TEMP/source-tags.json" \
+                --releases-json "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/pending.json"
+
+              SHOULD_STAGE="$(python3 -c 'import json, pathlib, sys; print("true" if json.loads(pathlib.Path(sys.argv[1]).read_text()).get("found") else "false")' "$RUNNER_TEMP/pending.json")"
+              if [ "$SHOULD_STAGE" = "true" ]; then
+                SOURCE_TAG="$(python3 -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_tag"])' "$RUNNER_TEMP/pending.json")"
+                SOURCE_SHA="$(python3 -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_sha"])' "$RUNNER_TEMP/pending.json")"
+                VERSION_INPUT="$(python3 -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text())["version"])' "$RUNNER_TEMP/pending.json")"
+              else
+                SOURCE_TAG=""
+                SOURCE_SHA=""
+                VERSION_INPUT=""
+              fi
+            else
+              SOURCE_REPO="${{ inputs.source_repo }}"
+              SOURCE_TAG="${{ inputs.source_tag }}"
+              SOURCE_SHA="${{ inputs.source_sha }}"
+              VERSION_INPUT="${{ inputs.version }}"
+              SHOULD_STAGE="true"
+            fi
+          fi
+
+          if [ "$SHOULD_STAGE" != "true" ]; then
+            {
+              echo "should_stage=false"
+              echo "source_repo=openelf-labs/openelf"
+              echo "source_repo_name=openelf"
+              echo "source_tag="
+              echo "source_sha="
+              echo "release_tag="
+              echo "version="
+              echo "channel="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           if [ -z "$SOURCE_REPO" ] || [ -z "$SOURCE_TAG" ] || [ -z "$SOURCE_SHA" ]; then
@@ -83,6 +156,7 @@ jobs:
           esac
 
           {
+            echo "should_stage=true"
             echo "source_repo=$SOURCE_REPO"
             echo "source_repo_name=${SOURCE_REPO##*/}"
             echo "source_tag=$SOURCE_TAG"
@@ -94,6 +168,7 @@ jobs:
 
   build-linux-windows:
     needs: resolve
+    if: ${{ needs.resolve.outputs.should_stage == 'true' }}
     runs-on: ubuntu-latest
     env:
       SOURCE_REPO_APP_ID: ${{ secrets.SOURCE_REPO_APP_ID }}
@@ -193,6 +268,7 @@ jobs:
 
   build-macos:
     needs: resolve
+    if: ${{ needs.resolve.outputs.should_stage == 'true' }}
     runs-on: macos-latest
     environment: release
     env:
@@ -429,6 +505,7 @@ jobs:
       - resolve
       - build-linux-windows
       - build-macos
+    if: ${{ needs.resolve.outputs.should_stage == 'true' }}
     runs-on: ubuntu-latest
     environment: release
     env:
