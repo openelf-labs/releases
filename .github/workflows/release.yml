@@ -608,7 +608,6 @@ jobs:
           else
             gh release create "$RELEASE_TAG" \
               --repo "${GITHUB_REPOSITORY}" \
-              --verify-tag \
               --draft \
               --title "OpenELF ${VERSION}" \
               --notes-file source/dist/changelog.txt \
