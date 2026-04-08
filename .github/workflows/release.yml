@@ -8,18 +8,23 @@ on:
     - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
+      auto_discover:
+        description: "Discover the next pending source tag automatically"
+        required: false
+        default: false
+        type: boolean
       source_repo:
         description: "Private source repository"
-        required: true
+        required: false
         default: "openelf-labs/openelf"
         type: string
       source_tag:
         description: "Release tag to publish, e.g. v0.2.0"
-        required: true
+        required: false
         type: string
       source_sha:
         description: "Exact source commit SHA to build"
-        required: true
+        required: false
         type: string
       version:
         description: "Release version without leading v (optional)"
@@ -94,7 +99,7 @@ jobs:
             VERSION_INPUT="${{ github.event.client_payload.version }}"
             SHOULD_STAGE="true"
           else
-            if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.auto_discover }}" = "true" ]; then
               SOURCE_REPO="openelf-labs/openelf"
               gh api "repos/${SOURCE_REPO}/tags?per_page=100" > "$RUNNER_TEMP/source-tags.json"
               gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
