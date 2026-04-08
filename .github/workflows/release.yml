@@ -1,0 +1,615 @@
+name: Release
+
+on:
+  repository_dispatch:
+    types:
+      - source-release
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Private source repository"
+        required: true
+        default: "openelf-labs/openelf"
+        type: string
+      source_tag:
+        description: "Release tag to publish, e.g. v0.2.0"
+        required: true
+        type: string
+      source_sha:
+        description: "Exact source commit SHA to build"
+        required: true
+        type: string
+      version:
+        description: "Release version without leading v (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.client_payload.release_tag || inputs.source_tag || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+  UPDATE_SITE_DOMAIN: "update.openelf.ai"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      source_repo: ${{ steps.params.outputs.source_repo }}
+      source_repo_name: ${{ steps.params.outputs.source_repo_name }}
+      source_tag: ${{ steps.params.outputs.source_tag }}
+      source_sha: ${{ steps.params.outputs.source_sha }}
+      release_tag: ${{ steps.params.outputs.release_tag }}
+      version: ${{ steps.params.outputs.version }}
+      channel: ${{ steps.params.outputs.channel }}
+    steps:
+      - name: Resolve release parameters
+        id: params
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            SOURCE_REPO="${{ github.event.client_payload.source_repo }}"
+            SOURCE_TAG="${{ github.event.client_payload.source_tag }}"
+            SOURCE_SHA="${{ github.event.client_payload.source_sha }}"
+            VERSION_INPUT="${{ github.event.client_payload.version }}"
+          else
+            SOURCE_REPO="${{ inputs.source_repo }}"
+            SOURCE_TAG="${{ inputs.source_tag }}"
+            SOURCE_SHA="${{ inputs.source_sha }}"
+            VERSION_INPUT="${{ inputs.version }}"
+          fi
+
+          if [ -z "$SOURCE_REPO" ] || [ -z "$SOURCE_TAG" ] || [ -z "$SOURCE_SHA" ]; then
+            echo "Missing required release parameters"
+            exit 1
+          fi
+          if [[ "$SOURCE_TAG" != v* ]]; then
+            echo "source_tag must start with v (got: $SOURCE_TAG)"
+            exit 1
+          fi
+
+          VERSION="${SOURCE_TAG#v}"
+          if [ -n "$VERSION_INPUT" ] && [ "$VERSION_INPUT" != "$VERSION" ]; then
+            echo "version input ($VERSION_INPUT) must match source_tag ($SOURCE_TAG)"
+            exit 1
+          fi
+
+          CHANNEL="stable"
+          case "$SOURCE_TAG" in
+            *alpha*|*beta*|*rc*) CHANNEL="beta" ;;
+          esac
+
+          {
+            echo "source_repo=$SOURCE_REPO"
+            echo "source_repo_name=${SOURCE_REPO##*/}"
+            echo "source_tag=$SOURCE_TAG"
+            echo "source_sha=$SOURCE_SHA"
+            echo "release_tag=$SOURCE_TAG"
+            echo "version=$VERSION"
+            echo "channel=$CHANNEL"
+          } >> "$GITHUB_OUTPUT"
+
+  build-linux-windows:
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - name: Create source repo app token
+        id: app-token
+        if: ${{ secrets.SOURCE_REPO_APP_ID != '' && secrets.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.SOURCE_REPO_APP_ID }}
+          private-key: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ needs.resolve.outputs.source_repo_name }}
+
+      - name: Resolve source checkout token
+        id: checkout-token
+        shell: bash
+        run: |
+          TOKEN="${{ steps.app-token.outputs.token }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.SOURCE_REPO_TOKEN }}"
+          fi
+          if [ -z "$TOKEN" ]; then
+            echo "Missing SOURCE_REPO_TOKEN or SOURCE_REPO_APP_* secrets"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout private source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: ${{ needs.resolve.outputs.source_repo }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          token: ${{ steps.checkout-token.outputs.token }}
+          path: source
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify source ref
+        shell: bash
+        run: |
+          cd source
+          test "$(git rev-parse HEAD)" = "${{ needs.resolve.outputs.source_sha }}"
+          test "$(git rev-list -n1 ${{ needs.resolve.outputs.source_tag }})" = "${{ needs.resolve.outputs.source_sha }}"
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: source/go.mod
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: source/web/package-lock.json
+
+      - name: Build web frontend
+        shell: bash
+        run: |
+          cd source/web
+          npm ci
+          npm run build
+
+      - name: Build and package
+        shell: bash
+        run: |
+          cd source
+          make release-package-platform \
+            VERSION="${{ needs.resolve.outputs.version }}" \
+            RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}" \
+            GOOS="${{ matrix.goos }}" \
+            GOARCH="${{ matrix.goarch }}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: source/dist/*
+          if-no-files-found: error
+
+  build-macos:
+    needs: resolve
+    runs-on: macos-latest
+    environment: release
+    steps:
+      - name: Create source repo app token
+        id: app-token
+        if: ${{ secrets.SOURCE_REPO_APP_ID != '' && secrets.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.SOURCE_REPO_APP_ID }}
+          private-key: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ needs.resolve.outputs.source_repo_name }}
+
+      - name: Resolve source checkout token
+        id: checkout-token
+        shell: bash
+        run: |
+          TOKEN="${{ steps.app-token.outputs.token }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.SOURCE_REPO_TOKEN }}"
+          fi
+          if [ -z "$TOKEN" ]; then
+            echo "Missing SOURCE_REPO_TOKEN or SOURCE_REPO_APP_* secrets"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout private source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: ${{ needs.resolve.outputs.source_repo }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          token: ${{ steps.checkout-token.outputs.token }}
+          path: source
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify source ref
+        shell: bash
+        run: |
+          cd source
+          test "$(git rev-parse HEAD)" = "${{ needs.resolve.outputs.source_sha }}"
+          test "$(git rev-list -n1 ${{ needs.resolve.outputs.source_tag }})" = "${{ needs.resolve.outputs.source_sha }}"
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: source/go.mod
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: source/web/package-lock.json
+
+      - name: Build web frontend
+        shell: bash
+        run: |
+          cd source/web
+          npm ci
+          npm run build
+
+      - name: Import macOS signing certificate
+        if: ${{ secrets.MACOS_SIGNING_KEY != '' }}
+        env:
+          MACOS_SIGNING_KEY: ${{ secrets.MACOS_SIGNING_KEY }}
+          MACOS_SIGNING_KEY_PASSWORD: ${{ secrets.MACOS_SIGNING_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          echo "$MACOS_SIGNING_KEY" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -P "$MACOS_SIGNING_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          rm -f "$RUNNER_TEMP/certificate.p12"
+
+      - name: Install create-dmg
+        shell: bash
+        run: brew install create-dmg
+
+      - name: Build macOS archives
+        shell: bash
+        run: |
+          cd source
+          make release-package-platform VERSION="${{ needs.resolve.outputs.version }}" RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}" GOOS=darwin GOARCH=amd64
+          make release-package-platform VERSION="${{ needs.resolve.outputs.version }}" RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}" GOOS=darwin GOARCH=arm64
+          KEEP_UNIVERSAL_BINARY=1 make release-package-darwin-universal VERSION="${{ needs.resolve.outputs.version }}" RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
+
+      - name: Build .app bundle
+        shell: bash
+        run: |
+          cd source
+          make fetch-apple-tools
+          cp dist/openelf ./openelf
+          make -C app/macos app APPLE_TOOLS_BINARY=../../build/bin/apple-tools
+          rm -f ./openelf dist/openelf
+
+      - name: Codesign .app
+        if: ${{ secrets.APPLE_IDENTITY != '' }}
+        env:
+          APPLE_IDENTITY: ${{ secrets.APPLE_IDENTITY }}
+        shell: bash
+        run: |
+          BUNDLE="source/app/macos/build/OpenELF.app"
+          BUNDLE_ID="ai.openelf.openelf"
+          codesign --sign "${APPLE_IDENTITY}" \
+            --identifier "${BUNDLE_ID}.cli" \
+            --options runtime --timestamp --force \
+            "${BUNDLE}/Contents/Resources/openelf"
+          if [ -f "${BUNDLE}/Contents/Resources/apple-tools" ]; then
+            codesign --sign "${APPLE_IDENTITY}" \
+              --identifier "${BUNDLE_ID}.apple-tools" \
+              --options runtime --timestamp --force \
+              "${BUNDLE}/Contents/Resources/apple-tools"
+          fi
+          codesign --sign "${APPLE_IDENTITY}" \
+            --identifier "${BUNDLE_ID}" \
+            --options runtime --timestamp --force \
+            "${BUNDLE}/Contents/MacOS/OpenELF"
+          codesign --sign "${APPLE_IDENTITY}" \
+            --identifier "${BUNDLE_ID}" \
+            --options runtime --timestamp --force \
+            --entitlements source/app/macos/OpenELF.entitlements \
+            "${BUNDLE}"
+
+      - name: Verify codesign
+        if: ${{ secrets.APPLE_IDENTITY != '' }}
+        shell: bash
+        run: |
+          BUNDLE="source/app/macos/build/OpenELF.app"
+          codesign --verify --strict --verbose=2 "$BUNDLE"
+
+      - name: Notarize .app
+        if: ${{ vars.APPLE_ID != '' }}
+        continue-on-error: true
+        env:
+          APPLE_ID: ${{ vars.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        shell: bash
+        run: |
+          ditto -c -k --keepParent source/app/macos/build/OpenELF.app source/dist/OpenELF-notarize.zip
+          bash source/scripts/notarize.sh source/dist/OpenELF-notarize.zip \
+            --staple source/app/macos/build/OpenELF.app
+          rm -f source/dist/OpenELF-notarize.zip
+
+      - name: Create DMG
+        shell: bash
+        run: |
+          create-dmg \
+            --volname "OpenELF" \
+            --window-pos 200 120 \
+            --window-size 660 400 \
+            --icon-size 128 \
+            --icon "OpenELF.app" 180 190 \
+            --hide-extension "OpenELF.app" \
+            --app-drop-link 480 190 \
+            --no-internet-enable \
+            "source/dist/OpenELF-${{ needs.resolve.outputs.version }}.dmg" \
+            "source/app/macos/build/OpenELF.app" \
+            || true
+
+      - name: Codesign DMG
+        if: ${{ secrets.APPLE_IDENTITY != '' }}
+        env:
+          APPLE_IDENTITY: ${{ secrets.APPLE_IDENTITY }}
+        shell: bash
+        run: |
+          codesign --sign "${APPLE_IDENTITY}" --timestamp --force \
+            "source/dist/OpenELF-${{ needs.resolve.outputs.version }}.dmg"
+          codesign --verify --strict "source/dist/OpenELF-${{ needs.resolve.outputs.version }}.dmg"
+
+      - name: Package .app zip
+        shell: bash
+        run: |
+          ditto -c -k --keepParent source/app/macos/build/OpenELF.app source/dist/OpenELF-darwin.zip
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: binaries-darwin
+          path: source/dist/*
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - resolve
+      - build-linux-windows
+      - build-macos
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Create source repo app token
+        id: app-token
+        if: ${{ secrets.SOURCE_REPO_APP_ID != '' && secrets.SOURCE_REPO_APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.SOURCE_REPO_APP_ID }}
+          private-key: ${{ secrets.SOURCE_REPO_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ needs.resolve.outputs.source_repo_name }}
+
+      - name: Resolve source checkout token
+        id: checkout-token
+        shell: bash
+        run: |
+          TOKEN="${{ steps.app-token.outputs.token }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.SOURCE_REPO_TOKEN }}"
+          fi
+          if [ -z "$TOKEN" ]; then
+            echo "Missing SOURCE_REPO_TOKEN or SOURCE_REPO_APP_* secrets"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout private source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: ${{ needs.resolve.outputs.source_repo }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          token: ${{ steps.checkout-token.outputs.token }}
+          path: source
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify source ref
+        shell: bash
+        run: |
+          cd source
+          test "$(git rev-parse HEAD)" = "${{ needs.resolve.outputs.source_sha }}"
+          test "$(git rev-list -n1 ${{ needs.resolve.outputs.source_tag }})" = "${{ needs.resolve.outputs.source_sha }}"
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: source/go.mod
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          path: source/dist
+          merge-multiple: true
+
+      - name: Generate checksums and release notes
+        shell: bash
+        run: |
+          cd source
+          make release-checksums release-notes \
+            VERSION="${{ needs.resolve.outputs.version }}" \
+            RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
+
+      - name: Sign artifacts and manifest
+        env:
+          SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        shell: bash
+        run: |
+          cd source
+          if [ -n "$SIGNING_PRIVATE_KEY" ]; then
+            make release-sign \
+              VERSION="${{ needs.resolve.outputs.version }}" \
+              RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
+          else
+            make release-manifest \
+              VERSION="${{ needs.resolve.outputs.version }}" \
+              RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
+          fi
+
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          cd source
+          RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
+          VERSION="${{ needs.resolve.outputs.version }}"
+          PRERELEASE_FLAG=()
+          if [ "${{ needs.resolve.outputs.channel }}" = "beta" ]; then
+            PRERELEASE_FLAG+=(--prerelease)
+          fi
+
+          gh release view "$RELEASE_TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "OpenELF ${VERSION}" \
+              --notes-file dist/changelog.txt \
+              "${PRERELEASE_FLAG[@]}"
+
+          UPLOAD_FILES=()
+          for f in dist/*.tar.gz dist/*.zip dist/*.dmg dist/checksums.txt dist/manifest.json; do
+            [ -f "$f" ] || continue
+            UPLOAD_FILES+=("$f")
+          done
+          gh release upload "$RELEASE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber \
+            "${UPLOAD_FILES[@]}"
+
+      - name: Resolve stable and beta aliases
+        id: aliases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          RELEASES_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          printf '%s' "$RELEASES_JSON" > "$RUNNER_TEMP/releases.json"
+          python3 - "$RUNNER_TEMP/releases.json" "$RUNNER_TEMP/aliases.json" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          def semver_key(tag_name: str):
+              tag = tag_name.lstrip("v")
+              core, _, pre = tag.partition("-")
+              major, minor, patch = (core.split(".") + ["0", "0", "0"])[:3]
+              pre_parts = []
+              if pre:
+                  for chunk in re.split(r"[.\-]", pre):
+                      if chunk.isdigit():
+                          pre_parts.append((0, int(chunk)))
+                      else:
+                          pre_parts.append((1, chunk))
+              return (int(major), int(minor), int(patch), tuple(pre_parts))
+
+          releases = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          stable_tags = []
+          beta_tags = []
+
+          for release in releases:
+              if release.get("draft"):
+                  continue
+              tag_name = release.get("tag_name")
+              if not tag_name:
+                  continue
+              if release.get("prerelease"):
+                  beta_tags.append(tag_name)
+              else:
+                  stable_tags.append(tag_name)
+
+          payload = {
+              "stable": sorted(stable_tags, key=semver_key, reverse=True)[0] if stable_tags else None,
+              "beta": sorted(beta_tags, key=semver_key, reverse=True)[0] if beta_tags else None,
+          }
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(payload), encoding="utf-8")
+          PY
+
+          STABLE_TAG="$(python3 -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get("stable") or "")' "$RUNNER_TEMP/aliases.json")"
+          BETA_TAG="$(python3 -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get("beta") or "")' "$RUNNER_TEMP/aliases.json")"
+
+          if [ -z "$STABLE_TAG" ]; then
+            echo "No stable release exists yet. Publish a stable tag before deploying update aliases."
+            exit 1
+          fi
+
+          echo "stable_tag=$STABLE_TAG" >> "$GITHUB_OUTPUT"
+          echo "beta_tag=$BETA_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download stable and beta manifests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          mkdir -p manifests/stable manifests/beta
+          gh release download "${{ steps.aliases.outputs.stable_tag }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern manifest.json \
+            --dir manifests/stable \
+            --clobber
+          if [ -n "${{ steps.aliases.outputs.beta_tag }}" ]; then
+            gh release download "${{ steps.aliases.outputs.beta_tag }}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern manifest.json \
+              --dir manifests/beta \
+              --clobber
+          fi
+
+      - name: Build update site
+        shell: bash
+        run: |
+          SITE_ARGS=(
+            --output-dir site
+            --install-script source/scripts/install.sh
+            --stable-manifest manifests/stable/manifest.json
+            --custom-domain "${UPDATE_SITE_DOMAIN}"
+            --releases-url "https://github.com/${GITHUB_REPOSITORY}/releases"
+          )
+          if [ -f manifests/beta/manifest.json ]; then
+            SITE_ARGS+=(--beta-manifest manifests/beta/manifest.json)
+          fi
+          python3 source/scripts/build_update_site.py "${SITE_ARGS[@]}"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: site
+
+  deploy-pages:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
