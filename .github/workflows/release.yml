@@ -1,4 +1,4 @@
-name: Release
+name: Stage Release
 
 on:
   repository_dispatch:
@@ -28,12 +28,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.client_payload.release_tag || inputs.source_tag || github.run_id }}
+  group: release-stage-${{ github.event.client_payload.release_tag || inputs.source_tag || github.run_id }}
   cancel-in-progress: false
 
 env:
   NODE_VERSION: "22"
-  UPDATE_SITE_DOMAIN: "update.openelf.ai"
 
 jobs:
   resolve:
@@ -203,7 +202,14 @@ jobs:
       MACOS_SIGNING_KEY: ${{ secrets.MACOS_SIGNING_KEY }}
       MACOS_SIGNING_KEY_PASSWORD: ${{ secrets.MACOS_SIGNING_KEY_PASSWORD }}
       APPLE_IDENTITY: ${{ secrets.APPLE_IDENTITY }}
+      APPLE_ID: ${{ vars.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    outputs:
+      notarization_required: ${{ steps.mode.outputs.required }}
+      notarization_status: ${{ steps.mode.outputs.status }}
+      notarization_submission_id: ${{ steps.submit.outputs.submission_id }}
+      staged_app_asset: ${{ steps.mode.outputs.staged_app_asset }}
     steps:
       - name: Create source repo app token
         id: app-token
@@ -338,21 +344,47 @@ jobs:
           BUNDLE="source/app/macos/build/OpenELF.app"
           codesign --verify --strict --verbose=2 "$BUNDLE"
 
-      - name: Notarize .app
-        if: ${{ vars.APPLE_ID != '' }}
-        continue-on-error: true
-        env:
-          APPLE_ID: ${{ vars.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-          APPLE_PASSWORD: ${{ env.APPLE_APP_PASSWORD }}
+      - name: Determine macOS release mode
+        id: mode
         shell: bash
         run: |
-          ditto -c -k --keepParent source/app/macos/build/OpenELF.app source/dist/OpenELF-notarize.zip
-          bash source/scripts/notarize.sh source/dist/OpenELF-notarize.zip \
-            --staple source/app/macos/build/OpenELF.app
-          rm -f source/dist/OpenELF-notarize.zip
+          STAGED_APP_ASSET="OpenELF-${{ needs.resolve.outputs.version }}-macos-staged-app.zip"
+          if [ -n "$APPLE_IDENTITY" ] && [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            echo "status=pending" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=false" >> "$GITHUB_OUTPUT"
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+          fi
+          echo "staged_app_asset=$STAGED_APP_ASSET" >> "$GITHUB_OUTPUT"
 
-      - name: Create DMG
+      - name: Submit notarization asynchronously
+        id: submit
+        if: ${{ steps.mode.outputs.required == 'true' }}
+        shell: bash
+        run: |
+          APP_ZIP="source/dist/${{ steps.mode.outputs.staged_app_asset }}"
+          ditto -c -k --keepParent source/app/macos/build/OpenELF.app "$APP_ZIP"
+          xcrun notarytool submit "$APP_ZIP" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --output-format json > "$RUNNER_TEMP/notary-submit.json"
+          python3 - "$RUNNER_TEMP/notary-submit.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          submission_id = str(payload.get("id") or "").strip()
+          if not submission_id:
+              raise SystemExit("Missing notarization submission id")
+          with open(sys.argv[2], "a", encoding="utf-8") as fh:
+              fh.write(f"submission_id={submission_id}\n")
+          PY
+
+      - name: Create final macOS archives without notarization
+        if: ${{ steps.mode.outputs.required != 'true' }}
         shell: bash
         run: |
           create-dmg \
@@ -367,28 +399,32 @@ jobs:
             "source/dist/OpenELF-${{ needs.resolve.outputs.version }}.dmg" \
             "source/app/macos/build/OpenELF.app" \
             || true
-
-      - name: Codesign DMG
-        if: ${{ env.APPLE_IDENTITY != '' }}
-        shell: bash
-        run: |
-          codesign --sign "${APPLE_IDENTITY}" --timestamp --force \
-            "source/dist/OpenELF-${{ needs.resolve.outputs.version }}.dmg"
-          codesign --verify --strict "source/dist/OpenELF-${{ needs.resolve.outputs.version }}.dmg"
-
-      - name: Package .app zip
-        shell: bash
-        run: |
+          if [ -n "$APPLE_IDENTITY" ]; then
+            codesign --sign "${APPLE_IDENTITY}" --timestamp --force \
+              "source/dist/OpenELF-${{ needs.resolve.outputs.version }}.dmg"
+            codesign --verify --strict "source/dist/OpenELF-${{ needs.resolve.outputs.version }}.dmg"
+          fi
           ditto -c -k --keepParent source/app/macos/build/OpenELF.app source/dist/OpenELF-darwin.zip
 
-      - name: Upload build artifacts
+      - name: Upload staged macOS artifacts
+        if: ${{ steps.mode.outputs.required == 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: binaries-darwin
+          path: |
+            source/dist/*.tar.gz
+            source/dist/${{ steps.mode.outputs.staged_app_asset }}
+          if-no-files-found: error
+
+      - name: Upload final macOS artifacts
+        if: ${{ steps.mode.outputs.required != 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: binaries-darwin
           path: source/dist/*
           if-no-files-found: error
 
-  publish:
+  stage-release:
     needs:
       - resolve
       - build-linux-windows
@@ -445,47 +481,26 @@ jobs:
           test "$(git rev-parse HEAD)" = "${{ needs.resolve.outputs.source_sha }}"
           test "$(git rev-list -n1 ${{ needs.resolve.outputs.source_tag }})" = "${{ needs.resolve.outputs.source_sha }}"
 
-      - name: Setup Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
-        with:
-          go-version-file: source/go.mod
-
-      - name: Download all build artifacts
+      - name: Download staged build artifacts
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          path: source/dist
+          path: staging
           merge-multiple: true
 
-      - name: Generate checksums and release notes
+      - name: Prepare release notes
         shell: bash
         run: |
+          mkdir -p source/dist
           cd source
-          make release-checksums release-notes \
+          make release-notes \
             VERSION="${{ needs.resolve.outputs.version }}" \
             RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
 
-      - name: Sign artifacts and manifest
-        env:
-          SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
-        shell: bash
-        run: |
-          cd source
-          if [ -n "$SIGNING_PRIVATE_KEY" ]; then
-            make release-sign \
-              VERSION="${{ needs.resolve.outputs.version }}" \
-              RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
-          else
-            make release-manifest \
-              VERSION="${{ needs.resolve.outputs.version }}" \
-              RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
-          fi
-
-      - name: Publish immutable release assets
+      - name: Create or validate draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          cd source
           RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
           VERSION="${{ needs.resolve.outputs.version }}"
           PRERELEASE_FLAG=()
@@ -493,132 +508,83 @@ jobs:
             PRERELEASE_FLAG+=(--prerelease)
           fi
 
-          gh release view "$RELEASE_TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
+          if gh release view "$RELEASE_TAG" --repo "${GITHUB_REPOSITORY}" --json isDraft >/dev/null 2>&1; then
+            IS_DRAFT="$(gh release view "$RELEASE_TAG" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft')"
+            if [ "$IS_DRAFT" != "true" ]; then
+              echo "Release ${RELEASE_TAG} already exists and is not a draft"
+              exit 1
+            fi
+            gh release edit "$RELEASE_TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --draft \
+              --title "OpenELF ${VERSION}" \
+              --notes-file source/dist/changelog.txt \
+              "${PRERELEASE_FLAG[@]}"
+          else
             gh release create "$RELEASE_TAG" \
               --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --draft \
               --title "OpenELF ${VERSION}" \
-              --notes-file dist/changelog.txt \
+              --notes-file source/dist/changelog.txt \
               "${PRERELEASE_FLAG[@]}"
+          fi
 
-          UPLOAD_FILES=()
-          for f in dist/*.tar.gz dist/*.zip dist/*.dmg dist/checksums.txt dist/manifest.json; do
-            [ -f "$f" ] || continue
-            UPLOAD_FILES+=("$f")
-          done
+      - name: Write release state
+        shell: bash
+        run: |
+          python3 - <<'PY' > staging/release-state.json
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          def iso_now() -> str:
+              return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+          payload = {
+              "schema_version": 1,
+              "release_tag": os.environ["RELEASE_TAG"],
+              "version": os.environ["VERSION"],
+              "channel": os.environ["CHANNEL"],
+              "source_repo": os.environ["SOURCE_REPO"],
+              "source_tag": os.environ["SOURCE_TAG"],
+              "source_sha": os.environ["SOURCE_SHA"],
+              "staged_at": iso_now(),
+              "finalized_at": None,
+              "notarization": {
+                  "required": os.environ["NOTARIZATION_REQUIRED"] == "true",
+                  "status": os.environ["NOTARIZATION_STATUS"],
+                  "submission_id": os.environ["NOTARIZATION_SUBMISSION_ID"],
+                  "staged_app_asset": os.environ["STAGED_APP_ASSET"],
+                  "last_checked_at": None,
+              },
+          }
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          PY
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          SOURCE_REPO: ${{ needs.resolve.outputs.source_repo }}
+          SOURCE_TAG: ${{ needs.resolve.outputs.source_tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          NOTARIZATION_REQUIRED: ${{ needs.build-macos.outputs.notarization_required }}
+          NOTARIZATION_STATUS: ${{ needs.build-macos.outputs.notarization_status }}
+          NOTARIZATION_SUBMISSION_ID: ${{ needs.build-macos.outputs.notarization_submission_id }}
+          STAGED_APP_ASSET: ${{ needs.build-macos.outputs.staged_app_asset }}
+
+      - name: Upload staged assets to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          RELEASE_TAG="${{ needs.resolve.outputs.release_tag }}"
+          mapfile -t UPLOAD_FILES < <(find staging -maxdepth 1 -type f | sort)
+          if [ "${#UPLOAD_FILES[@]}" -eq 0 ]; then
+            echo "No staged release assets found"
+            exit 1
+          fi
           gh release upload "$RELEASE_TAG" \
             --repo "${GITHUB_REPOSITORY}" \
             --clobber \
             "${UPLOAD_FILES[@]}"
-
-      - name: Resolve stable and beta aliases
-        id: aliases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          RELEASES_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
-          printf '%s' "$RELEASES_JSON" > "$RUNNER_TEMP/releases.json"
-          python3 - "$RUNNER_TEMP/releases.json" "$RUNNER_TEMP/aliases.json" <<'PY'
-          import json
-          import pathlib
-          import re
-          import sys
-
-          def semver_key(tag_name: str):
-              tag = tag_name.lstrip("v")
-              core, _, pre = tag.partition("-")
-              major, minor, patch = (core.split(".") + ["0", "0", "0"])[:3]
-              pre_parts = []
-              if pre:
-                  for chunk in re.split(r"[.\-]", pre):
-                      if chunk.isdigit():
-                          pre_parts.append((0, int(chunk)))
-                      else:
-                          pre_parts.append((1, chunk))
-              return (int(major), int(minor), int(patch), tuple(pre_parts))
-
-          releases = json.loads(pathlib.Path(sys.argv[1]).read_text())
-          stable_tags = []
-          beta_tags = []
-
-          for release in releases:
-              if release.get("draft"):
-                  continue
-              tag_name = release.get("tag_name")
-              if not tag_name:
-                  continue
-              if release.get("prerelease"):
-                  beta_tags.append(tag_name)
-              else:
-                  stable_tags.append(tag_name)
-
-          payload = {
-              "stable": sorted(stable_tags, key=semver_key, reverse=True)[0] if stable_tags else None,
-              "beta": sorted(beta_tags, key=semver_key, reverse=True)[0] if beta_tags else None,
-          }
-          pathlib.Path(sys.argv[2]).write_text(json.dumps(payload), encoding="utf-8")
-          PY
-
-          STABLE_TAG="$(python3 -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get("stable") or "")' "$RUNNER_TEMP/aliases.json")"
-          BETA_TAG="$(python3 -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get("beta") or "")' "$RUNNER_TEMP/aliases.json")"
-
-          if [ -z "$STABLE_TAG" ]; then
-            echo "No stable release exists yet. Publish a stable tag before deploying update aliases."
-            exit 1
-          fi
-
-          echo "stable_tag=$STABLE_TAG" >> "$GITHUB_OUTPUT"
-          echo "beta_tag=$BETA_TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Download stable and beta manifests
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          mkdir -p manifests/stable manifests/beta
-          gh release download "${{ steps.aliases.outputs.stable_tag }}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --pattern manifest.json \
-            --dir manifests/stable \
-            --clobber
-          if [ -n "${{ steps.aliases.outputs.beta_tag }}" ]; then
-            gh release download "${{ steps.aliases.outputs.beta_tag }}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --pattern manifest.json \
-              --dir manifests/beta \
-              --clobber
-          fi
-
-      - name: Build update site
-        shell: bash
-        run: |
-          SITE_ARGS=(
-            --output-dir site
-            --install-script source/scripts/install.sh
-            --stable-manifest manifests/stable/manifest.json
-            --custom-domain "${UPDATE_SITE_DOMAIN}"
-            --releases-url "https://github.com/${GITHUB_REPOSITORY}/releases"
-          )
-          if [ -f manifests/beta/manifest.json ]; then
-            SITE_ARGS+=(--beta-manifest manifests/beta/manifest.json)
-          fi
-          python3 source/scripts/build_update_site.py "${SITE_ARGS[@]}"
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
-        with:
-          path: site
-
-  deploy-pages:
-    needs: publish
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy Pages
-        id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
