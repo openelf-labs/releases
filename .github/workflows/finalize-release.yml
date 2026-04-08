@@ -225,15 +225,7 @@ jobs:
               --password "$APPLE_PASSWORD" \
               --team-id "$APPLE_TEAM_ID" \
               --output-format json > "$RUNNER_TEMP/notary-info.json"
-            STATUS="$(python3 - "$RUNNER_TEMP/notary-info.json" <<'PY'
-            import json
-            import pathlib
-            import sys
-
-            payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-            print(str(payload.get("status") or "").strip())
-            PY
-            )"
+            STATUS="$(python3 -c 'import json, pathlib, sys; print(str(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")).get("status") or "").strip())' "$RUNNER_TEMP/notary-info.json")"
           fi
 
           STATUS_LOWER="$(printf '%s' "$STATUS" | tr '[:upper:]' '[:lower:]')"
