@@ -12,6 +12,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--source-tags-json", required=True, help="GitHub tags API payload")
     parser.add_argument("--releases-json", required=True, help="GitHub releases API payload")
+    parser.add_argument(
+        "--minimum-tag",
+        default="",
+        help="Ignore source tags older than this tag (inclusive lower bound)",
+    )
     return parser.parse_args()
 
 
@@ -48,12 +53,15 @@ def main() -> int:
     }
 
     pending = []
+    minimum_key = semver_key(args.minimum_tag) if args.minimum_tag else None
     for tag in source_tags:
         tag_name = str(tag.get("name") or "")
         source_sha = str((tag.get("commit") or {}).get("sha") or "")
         if not tag_name or not source_sha:
             continue
         if not tag_name.startswith("v"):
+            continue
+        if minimum_key is not None and semver_key(tag_name) < minimum_key:
             continue
         if tag_name in seen_release_tags:
             continue

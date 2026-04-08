@@ -13,7 +13,7 @@ SCRIPT = ROOT / "discover_pending_source_release.py"
 
 
 class DiscoverPendingSourceReleaseTests(unittest.TestCase):
-    def run_script(self, source_tags, releases):
+    def run_script(self, source_tags, releases, *args):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = pathlib.Path(tmpdir)
             source_path = tmp / "source-tags.json"
@@ -28,6 +28,7 @@ class DiscoverPendingSourceReleaseTests(unittest.TestCase):
                     str(source_path),
                     "--releases-json",
                     str(release_path),
+                    *args,
                 ],
                 capture_output=True,
                 text=True,
@@ -72,6 +73,16 @@ class DiscoverPendingSourceReleaseTests(unittest.TestCase):
         releases = [{"tag_name": "v0.2.1"}]
         selected = self.run_script(source_tags, releases)
         self.assertFalse(selected["found"])
+
+    def test_honors_minimum_tag_cutoff(self):
+        source_tags = [
+            {"name": "v0.2.0", "commit": {"sha": "a" * 40}},
+            {"name": "v0.2.1", "commit": {"sha": "b" * 40}},
+        ]
+        releases = []
+        selected = self.run_script(source_tags, releases, "--minimum-tag", "v0.2.1")
+        self.assertTrue(selected["found"])
+        self.assertEqual(selected["source_tag"], "v0.2.1")
 
 
 if __name__ == "__main__":

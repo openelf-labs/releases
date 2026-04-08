@@ -40,6 +40,7 @@ concurrency:
 
 env:
   NODE_VERSION: "22"
+  AUTO_DISCOVERY_MIN_SOURCE_TAG: "v0.2.1"
 
 jobs:
   resolve:
@@ -101,11 +102,13 @@ jobs:
           else
             if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.auto_discover }}" = "true" ]; then
               SOURCE_REPO="openelf-labs/openelf"
+              MIN_SOURCE_TAG="${AUTO_DISCOVERY_MIN_SOURCE_TAG:-v0.2.1}"
               gh api "repos/${SOURCE_REPO}/tags?per_page=100" > "$RUNNER_TEMP/source-tags.json"
               gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
               python3 scripts/discover_pending_source_release.py \
                 --source-tags-json "$RUNNER_TEMP/source-tags.json" \
-                --releases-json "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/pending.json"
+                --releases-json "$RUNNER_TEMP/releases.json" \
+                --minimum-tag "$MIN_SOURCE_TAG" > "$RUNNER_TEMP/pending.json"
 
               SHOULD_STAGE="$(python3 -c 'import json, pathlib, sys; print("true" if json.loads(pathlib.Path(sys.argv[1]).read_text()).get("found") else "false")' "$RUNNER_TEMP/pending.json")"
               if [ "$SHOULD_STAGE" = "true" ]; then
