@@ -38,6 +38,7 @@ jobs:
       contents: write
     outputs:
       has_release: ${{ steps.state.outputs.has_release }}
+      release_is_draft: ${{ steps.state.outputs.release_is_draft }}
       source_repo: ${{ steps.state.outputs.source_repo }}
       source_repo_name: ${{ steps.state.outputs.source_repo_name }}
       source_tag: ${{ steps.state.outputs.source_tag }}
@@ -54,7 +55,7 @@ jobs:
       - name: Checkout release repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Select draft release
+      - name: Select release candidate
         id: candidate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -88,6 +89,8 @@ jobs:
 
           RELEASE_TAG="$(python3 -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text())["tag_name"])' "$RUNNER_TEMP/selected.json")"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          RELEASE_IS_DRAFT="$(python3 -c 'import json, pathlib, sys; print("true" if json.loads(pathlib.Path(sys.argv[1]).read_text()).get("is_draft") else "false")' "$RUNNER_TEMP/selected.json")"
+          echo "release_is_draft=$RELEASE_IS_DRAFT" >> "$GITHUB_OUTPUT"
 
       - name: Download release state
         if: ${{ steps.candidate.outputs.found == 'true' }}
@@ -110,6 +113,7 @@ jobs:
           if [ "${{ steps.candidate.outputs.found }}" != "true" ]; then
             {
               echo "has_release=false"
+              echo "release_is_draft=false"
               echo "notarization_bypass=false"
             } >> "$GITHUB_OUTPUT"
             exit 0
@@ -148,6 +152,8 @@ jobs:
               for key, value in outputs.items():
                   fh.write(f"{key}={value}\n")
           PY
+
+          echo "release_is_draft=${{ steps.candidate.outputs.release_is_draft }}" >> "$GITHUB_OUTPUT"
 
           BYPASS="false"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.bypass_notarization }}" = "true" ]; then
@@ -296,7 +302,7 @@ jobs:
     needs:
       - resolve
       - finalize-macos
-    if: ${{ needs.resolve.outputs.has_release == 'true' && (needs.resolve.outputs.notarization_required != 'true' || needs.resolve.outputs.notarization_bypass == 'true' || needs.finalize-macos.outputs.ready_to_publish == 'true') }}
+    if: ${{ needs.resolve.outputs.has_release == 'true' && (needs.resolve.outputs.release_is_draft == 'true' || needs.finalize-macos.outputs.ready_to_publish == 'true') && (needs.resolve.outputs.notarization_required != 'true' || needs.resolve.outputs.notarization_bypass == 'true' || needs.finalize-macos.outputs.ready_to_publish == 'true') }}
     runs-on: ubuntu-latest
     environment: release
     env:
@@ -415,11 +421,15 @@ jobs:
             dist/checksums.txt \
             dist/manifest.json
 
-      - name: Remove draft-only assets
+      - name: Remove finalize state assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
+          if [ "${{ needs.resolve.outputs.notarization_required }}" = "true" ] && [ "${{ needs.resolve.outputs.notarization_bypass }}" = "true" ] && [ "${{ needs.finalize-macos.outputs.ready_to_publish }}" != "true" ]; then
+            echo "Preserving release-state.json and staged macOS app for a later finalize pass."
+            exit 0
+          fi
           gh release delete-asset "${{ needs.resolve.outputs.release_tag }}" \
             release-state.json \
             --repo "${GITHUB_REPOSITORY}" \
@@ -431,7 +441,7 @@ jobs:
               --yes || true
           fi
 
-      - name: Publish draft release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash

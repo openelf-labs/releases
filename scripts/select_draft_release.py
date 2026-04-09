@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Select a draft GitHub release that carries release-state.json."
+        description="Select a GitHub release that carries release-state.json."
     )
     parser.add_argument("--releases-json", required=True, help="Path to GitHub releases API JSON")
     parser.add_argument("--release-tag", default="", help="Exact release tag to select")
@@ -32,8 +32,6 @@ def main() -> int:
 
     candidates = []
     for release in releases:
-        if not release.get("draft"):
-            continue
         tag_name = str(release.get("tag_name") or "")
         if args.release_tag and tag_name != args.release_tag:
             continue
@@ -51,6 +49,7 @@ def main() -> int:
                 "found": True,
                 "release_id": release.get("id"),
                 "tag_name": tag_name,
+                "is_draft": bool(release.get("draft")),
                 "created_at": release.get("created_at"),
                 "state_asset_id": state_asset.get("id"),
                 "state_asset_name": state_asset.get("name"),
